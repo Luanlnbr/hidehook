@@ -15,27 +15,15 @@ jobs:
     - name: Setup Android NDK
       uses: nttld/setup-ndk@v1
       with:
-        ndk-version: r25c
+        ndk-version: r26b
 
-    - name: Baixar Zygisk API
-      run: |
-        git clone https://github.com/Dr-TSNG/Zygisk-NDK.git zygisk-ndk
-
-    - name: Baixar xHook
-      run: |
-        git clone https://github.com/iqiyi/xHook.git
-
-    - name: Configurar CMake
+    - name: Build with CMake
       run: |
         mkdir build && cd build
         cmake .. -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29
-
-    - name: Compilar (Build)
-      run: |
-        cd build
         make
 
-    - name: Salvar o arquivo pronto (Upload)
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: hidehook-so
