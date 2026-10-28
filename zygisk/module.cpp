@@ -10,10 +10,7 @@
 #include <dlfcn.h>
 #include <dirent.h>
 #include <fcntl.h>
-#include <android/log.h>
-
-#define LOG_TAG "HideHook"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#include <xhook.h> // Agora sim, o xHook oficial
 
 static std::vector<std::string> g_hide_paths;
 static std::vector<std::string> g_hide_procs;
@@ -38,8 +35,31 @@ static bool is_hidden(const char* p) {
     return false;
 }
 
-static int (*orig_open)(const char*, int, ...) = nullptr;
+static bool is_hidden_proc(const char* p) {
+    if (!p) return false;
+    for (auto& h : g_hide_procs) if (strstr(p, h.c_str())) return true;
+    return false;
+}
 
+// ==================== HOOKS ====================
+static int (*orig_open)(const char*, int, ...) = nullptr;
+static struct dirent* (*orig_readdir)(DIR*) = nullptr;
+static FILE* (*orig_fopen)(const char*, const char*) = nullptr;
+
+// 1. Esconder arquivos
+static int hook_open(const char* path, int flags, ...) {
+    if (is_hidden(path)) { errno = ENOENT; return -1; }
+    va_list a; va_start(a, flags);
+    mode_t m = va_arg(a, mode_t); va_end(a);
+    return orig_open(path, flags, m);
+}
+
+static FILE* hook_fopen(const char* path, const char* mode) {
+    if (is_hidden(path)) return nullptr;
+    return orig_fopen(path, mode);
+}
+
+// 2. Filtrar /proc/self/maps (esconde libs do PandaXE e do Root)
 static int make_filtered_maps() {
     int real = orig_open("/proc/self/maps", O_RDONLY);
     if (real < 0) return real;
@@ -55,7 +75,12 @@ static int make_filtered_maps() {
         size_t nl = content.find('\n', pos);
         if (nl == std::string::npos) nl = content.size();
         std::string line = content.substr(pos, nl - pos);
-        if (!is_hidden(line.c_str())) filtered += line + "\n";
+        bool hide = false;
+        // Esconde paths configurados E libs do Pandaxe
+        for (auto& h : g_hide_paths) if (line.find(h) != std::string::npos) { hide = true; break; }
+        if (line.find("pandaxe") != std::string::npos || line.find("com.pandaxe") != std::string::npos) hide = true;
+        
+        if (!hide) filtered += line + "\n";
         pos = nl + 1;
     }
 
@@ -66,23 +91,32 @@ static int make_filtered_maps() {
     return memfd;
 }
 
-static int hook_open(const char* path, int flags, ...) {
-    if (is_hidden(path)) { errno = ENOENT; return -1; }
+static int hook_open_maps(const char* path, int flags, ...) {
     if (path && strcmp(path, "/proc/self/maps") == 0) return make_filtered_maps();
     va_list a; va_start(a, flags);
     mode_t m = va_arg(a, mode_t); va_end(a);
     return orig_open(path, flags, m);
 }
 
-// Função que será chamada quando o Zygisk carregar (usando JNI nativo puro)
-extern "C" JNIEXPORT void JNICALL
-Java_com_x7f2k9_q3mz_MainActivity_initHook(JNIEnv *env, jobject /* this */) {
-    // Aqui o hook é inicializado no processo do app alvo
-    load_config();
-    void* libc = dlopen("libc.so", RTLD_LAZY);
-    if (libc) {
-        orig_open = (int(*)(const char*, int, ...))dlsym(libc, "open");
-        // Lógica de substituição básica (sem xhook) para evitar dependências
-        LOGI("Hook initialized.");
+// 3. Esconder processos (/proc)
+static struct dirent* hook_readdir(DIR* dir) {
+    struct dirent* e;
+    while ((e = orig_readdir(dir)) != nullptr) {
+        if (!is_hidden_proc(e->d_name)) return e;
     }
+    return nullptr;
+}
+
+// ==================== INICIALIZAÇÃO ====================
+__attribute__((constructor))
+static void init_hooks() {
+    load_config();
+    if (g_hide_paths.empty() && g_hide_procs.empty()) return;
+
+    // Aplica os hooks usando xHook
+    xhook_register(".*\\.so$", "open", (void*)hook_open, (void**)&orig_open);
+    xhook_register(".*\\.so$", "open", (void*)hook_open_maps, (void**)&orig_open);
+    xhook_register(".*\\.so$", "fopen", (void*)hook_fopen, (void**)&orig_fopen);
+    xhook_register(".*\\.so$", "readdir", (void*)hook_readdir, (void**)&orig_readdir);
+    xhook_refresh(0);
 }
