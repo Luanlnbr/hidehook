@@ -7,13 +7,20 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <stdarg.h>
-#include <dlfcn.h>
 #include <dirent.h>
 #include <fcntl.h>
-#include <xhook.h> // Agora sim, o xHook oficial
+#include <dlfcn.h>
+
+// Includes corretos do Zygisk e do xHook
+#include <zygisk.hpp>
+#include <xhook.h>
+
+using zygisk::Api;
+using zygisk::AppSpecializeArgs;
 
 static std::vector<std::string> g_hide_paths;
 static std::vector<std::string> g_hide_procs;
+static bool g_is_target = false;
 
 static void load_config() {
     FILE* f = fopen("/data/adb/hidehook/config.txt", "r");
@@ -41,28 +48,15 @@ static bool is_hidden_proc(const char* p) {
     return false;
 }
 
-// ==================== HOOKS ====================
+// ==================== Hooks ====================
 static int (*orig_open)(const char*, int, ...) = nullptr;
 static struct dirent* (*orig_readdir)(DIR*) = nullptr;
-static FILE* (*orig_fopen)(const char*, const char*) = nullptr;
 
-// 1. Esconder arquivos
-static int hook_open(const char* path, int flags, ...) {
-    if (is_hidden(path)) { errno = ENOENT; return -1; }
-    va_list a; va_start(a, flags);
-    mode_t m = va_arg(a, mode_t); va_end(a);
-    return orig_open(path, flags, m);
-}
-
-static FILE* hook_fopen(const char* path, const char* mode) {
-    if (is_hidden(path)) return nullptr;
-    return orig_fopen(path, mode);
-}
-
-// 2. Filtrar /proc/self/maps (esconde libs do PandaXE e do Root)
+// 1. Filtra o /proc/self/maps (Esconde libs injetadas)
 static int make_filtered_maps() {
     int real = orig_open("/proc/self/maps", O_RDONLY);
     if (real < 0) return real;
+    
     std::string content;
     char buf[65536];
     ssize_t n;
@@ -75,10 +69,12 @@ static int make_filtered_maps() {
         size_t nl = content.find('\n', pos);
         if (nl == std::string::npos) nl = content.size();
         std::string line = content.substr(pos, nl - pos);
+        
+        // Se a linha tiver coisas suspeitas, a gente pula (não adiciona)
         bool hide = false;
-        // Esconde paths configurados E libs do Pandaxe
-        for (auto& h : g_hide_paths) if (line.find(h) != std::string::npos) { hide = true; break; }
-        if (line.find("pandaxe") != std::string::npos || line.find("com.pandaxe") != std::string::npos) hide = true;
+        if (is_hidden(line.c_str())) hide = true;
+        if (line.find("pandaxe") != std::string::npos) hide = true;
+        if (line.find("data/adb") != std::string::npos) hide = true;
         
         if (!hide) filtered += line + "\n";
         pos = nl + 1;
@@ -91,14 +87,16 @@ static int make_filtered_maps() {
     return memfd;
 }
 
-static int hook_open_maps(const char* path, int flags, ...) {
+static int hook_open(const char* path, int flags, ...) {
+    if (is_hidden(path)) { errno = ENOENT; return -1; }
     if (path && strcmp(path, "/proc/self/maps") == 0) return make_filtered_maps();
+    
     va_list a; va_start(a, flags);
     mode_t m = va_arg(a, mode_t); va_end(a);
     return orig_open(path, flags, m);
 }
 
-// 3. Esconder processos (/proc)
+// 2. Esconde processos (Esconde o Pandaxe e o KernelSU da lista do jogo)
 static struct dirent* hook_readdir(DIR* dir) {
     struct dirent* e;
     while ((e = orig_readdir(dir)) != nullptr) {
@@ -107,16 +105,42 @@ static struct dirent* hook_readdir(DIR* dir) {
     return nullptr;
 }
 
-// ==================== INICIALIZAÇÃO ====================
-__attribute__((constructor))
-static void init_hooks() {
-    load_config();
-    if (g_hide_paths.empty() && g_hide_procs.empty()) return;
+// ==================== Zygisk Entry ====================
+class HideHookModule : public zygisk::ModuleBase {
+public:
+    void onLoad(Api* api, JNIEnv* env) override {
+        this->api = api;
+        this->env = env;
+    }
 
-    // Aplica os hooks usando xHook
-    xhook_register(".*\\.so$", "open", (void*)hook_open, (void**)&orig_open);
-    xhook_register(".*\\.so$", "open", (void*)hook_open_maps, (void**)&orig_open);
-    xhook_register(".*\\.so$", "fopen", (void*)hook_fopen, (void**)&orig_fopen);
-    xhook_register(".*\\.so$", "readdir", (void*)hook_readdir, (void**)&orig_readdir);
-    xhook_refresh(0);
-}
+    void preAppSpecialize(AppSpecializeArgs* args) override {
+        // Só ativa o hook se o app for o Free Fire (ou outro no config)
+        if (args->nice_name) {
+            const char* pkg = env->GetStringUTFChars(args->nice_name, nullptr);
+            if (pkg) {
+                std::string s(pkg);
+                if (s == "com.dts.freefireth" || s == "com.dts.freefiremax") {
+                    g_is_target = true;
+                }
+                env->ReleaseStringUTFChars(args->nice_name, pkg);
+            }
+        }
+    }
+
+    void postAppSpecialize(const AppSpecializeArgs*) override {
+        if (!g_is_target) return;
+        
+        load_config();
+        
+        // Aplica os hooks no processo do jogo
+        xhook_register(".*\\.so$", "open", (void*)hook_open, (void**)&orig_open);
+        xhook_register(".*\\.so$", "readdir", (void*)hook_readdir, (void**)&orig_readdir);
+        xhook_refresh(0);
+    }
+
+private:
+    Api* api;
+    JNIEnv* env;
+};
+
+REGISTER_ZYGISK_MODULE(HideHookModule)
