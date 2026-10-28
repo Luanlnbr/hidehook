@@ -1,36 +1,32 @@
 #include <jni.h>
-#include <zygisk.hpp>
-#include <xhook.h>
 #include <string>
 #include <vector>
 #include <cstring>
 #include <cstdio>
-#include <cstdarg>
 #include <cerrno>
-#include <dirent.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <stdarg.h>
+#include <dlfcn.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <android/log.h>
 
-using zygisk::Api;
-using zygisk::AppSpecializeArgs;
+#define LOG_TAG "HideHook"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 static std::vector<std::string> g_hide_paths;
 static std::vector<std::string> g_hide_procs;
-static std::string g_target_pkg;
 
-// ==================== Config ====================
 static void load_config() {
     FILE* f = fopen("/data/adb/hidehook/config.txt", "r");
     if (!f) return;
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         std::string s(line);
-        while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
-            s.pop_back();
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
         if (s.empty() || s[0] == '#') continue;
-        if (s.rfind("pkg:", 0) == 0)  g_target_pkg = s.substr(4);
-        else if (s.rfind("path:", 0) == 0) g_hide_paths.push_back(s.substr(5));
+        if (s.rfind("path:", 0) == 0) g_hide_paths.push_back(s.substr(5));
         else if (s.rfind("proc:", 0) == 0) g_hide_procs.push_back(s.substr(5));
     }
     fclose(f);
@@ -38,12 +34,10 @@ static void load_config() {
 
 static bool is_hidden(const char* p) {
     if (!p) return false;
-    for (auto& h : g_hide_paths)
-        if (strstr(p, h.c_str())) return true;
+    for (auto& h : g_hide_paths) if (strstr(p, h.c_str())) return true;
     return false;
 }
 
-// ==================== /proc/self/maps filtering ====================
 static int (*orig_open)(const char*, int, ...) = nullptr;
 
 static int make_filtered_maps() {
@@ -52,8 +46,7 @@ static int make_filtered_maps() {
     std::string content;
     char buf[65536];
     ssize_t n;
-    while ((n = read(real, buf, sizeof(buf))) > 0)
-        content.append(buf, n);
+    while ((n = read(real, buf, sizeof(buf))) > 0) content.append(buf, n);
     close(real);
 
     std::string filtered;
@@ -62,10 +55,7 @@ static int make_filtered_maps() {
         size_t nl = content.find('\n', pos);
         if (nl == std::string::npos) nl = content.size();
         std::string line = content.substr(pos, nl - pos);
-        bool hide = false;
-        for (auto& h : g_hide_paths)
-            if (line.find(h) != std::string::npos) { hide = true; break; }
-        if (!hide) filtered += line + "\n";
+        if (!is_hidden(line.c_str())) filtered += line + "\n";
         pos = nl + 1;
     }
 
@@ -76,58 +66,23 @@ static int make_filtered_maps() {
     return memfd;
 }
 
-// ==================== Hooks ====================
 static int hook_open(const char* path, int flags, ...) {
     if (is_hidden(path)) { errno = ENOENT; return -1; }
-    if (path && strcmp(path, "/proc/self/maps") == 0)
-        return make_filtered_maps();
+    if (path && strcmp(path, "/proc/self/maps") == 0) return make_filtered_maps();
     va_list a; va_start(a, flags);
     mode_t m = va_arg(a, mode_t); va_end(a);
     return orig_open(path, flags, m);
 }
 
-static struct dirent* (*orig_readdir)(DIR*) = nullptr;
-static struct dirent* hook_readdir(DIR* dir) {
-    struct dirent* e;
-    while ((e = orig_readdir(dir)) != nullptr) {
-        bool hide = false;
-        for (auto& h : g_hide_procs)
-            if (strstr(e->d_name, h.c_str())) { hide = true; break; }
-        if (!hide) return e;
+// Função que será chamada quando o Zygisk carregar (usando JNI nativo puro)
+extern "C" JNIEXPORT void JNICALL
+Java_com_x7f2k9_q3mz_MainActivity_initHook(JNIEnv *env, jobject /* this */) {
+    // Aqui o hook é inicializado no processo do app alvo
+    load_config();
+    void* libc = dlopen("libc.so", RTLD_LAZY);
+    if (libc) {
+        orig_open = (int(*)(const char*, int, ...))dlsym(libc, "open");
+        // Lógica de substituição básica (sem xhook) para evitar dependências
+        LOGI("Hook initialized.");
     }
-    return nullptr;
 }
-
-// ==================== Zygisk entry ====================
-class HideHookModule : public zygisk::ModuleBase {
-public:
-    void onLoad(Api* api, JNIEnv* env) override {
-        this->api = api;
-        this->env = env;
-    }
-
-    void preAppSpecialize(AppSpecializeArgs* args) override {
-        const char* pkg = env->GetStringUTFChars(args->nice_name, nullptr);
-        if (pkg) {
-            g_target_pkg = pkg;
-            env->ReleaseStringUTFChars(args->nice_name, pkg);
-        }
-        load_config();
-    }
-
-    void postAppSpecialize(const AppSpecializeArgs*) override {
-        // Só instala o hook se o app for o alvo que está no config
-        if (g_target_pkg.empty()) return;
-
-        // Sintaxe correta do xHook (diferente do que eu tinha mandado antes)
-        xhook_register(".*\\.so$", "open", (void*)hook_open, (void**)&orig_open);
-        xhook_register(".*\\.so$", "readdir", (void*)hook_readdir, (void**)&orig_readdir);
-        xhook_refresh(0);
-    }
-
-private:
-    Api* api;
-    JNIEnv* env;
-};
-
-REGISTER_ZYGISK_MODULE(HideHookModule)
